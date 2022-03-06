@@ -1,0 +1,15 @@
+{
+  "rules": [
+    {
+      "from": {
+        "host": "localhost",
+        "path": "/test_from"
+      },
+      "to": {
+        "host": "localhost",
+        "path": "/test_to"
+      },
+      "public": false
+    }
+  ]
+}
