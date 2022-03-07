@@ -1,12 +1,11 @@
 use std::path::PathBuf;
 
-use hyper::client::Client;
 use log::info;
 
-use simple_proxy::Environment;
+use simple_proxy::middlewares::router::RouterConfig;
 use simple_proxy::middlewares::Logger;
 use simple_proxy::middlewares::Router;
-use simple_proxy::middlewares::router::RouterConfig;
+use simple_proxy::Environment;
 use simple_proxy::SimpleProxy;
 
 mod common;
@@ -15,8 +14,9 @@ mod common;
 mod tests {
     use std::error::Error;
 
+    use hyper::client::Client;
     use tokio::task::JoinHandle;
-    use tokio::time::Duration;
+    use tokio::time::{self, Duration};
 
     use super::*;
 
@@ -31,16 +31,15 @@ mod tests {
         }
     }
 
-    fn build_server() -> SimpleProxy {
+    fn build_test_proxy() -> SimpleProxy {
         let mut proxy = SimpleProxy::new(TEST_PORT, Environment::Development);
         let logger = Logger::new();
 
-        let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        d.push("tests/test_routes.json");
-        let path = d.to_str().unwrap().to_string();
+        let mut test_config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        test_config_path.push("tests/test_routes.json");
+        let path = test_config_path.to_str().unwrap().to_string();
         let router = Router::new(&Config(path));
 
-        // Order matters
         proxy.add_middleware(Box::new(router));
         proxy.add_middleware(Box::new(logger));
 
@@ -48,7 +47,7 @@ mod tests {
     }
 
     async fn start_server() -> JoinHandle<Result<(), Box<dyn Error + Send + Sync>>> {
-        let server = build_server();
+        let server = build_test_proxy();
 
         info!("Starting proxy server in the background");
         tokio::spawn(async move { server.run().await })
@@ -64,9 +63,30 @@ mod tests {
 
         let client = Client::new();
 
-        let uri = format!("http://localhost:{}/test_from", TEST_PORT).parse()?;
-        let resp = client.get(uri).await?;
-        assert_eq!(404, resp.status().as_u16());
+        let mut interval = time::interval(Duration::from_millis(100));
+        for _ in 0..10 {
+            let uri = format!("http://localhost:{}/test_from", TEST_PORT).parse()?;
+            interval.tick().await;
+            let resp = client.get(uri).await?;
+            assert_eq!(404, resp.status().as_u16());
+        }
+
+        let mut interval = time::interval(Duration::from_millis(10));
+        let mut too_many = false;
+        let mut not_found = false;
+        for _ in 0..50 {
+            let uri = format!("http://localhost:{}/test_from", TEST_PORT).parse()?;
+            interval.tick().await;
+            let resp = client.get(uri).await?;
+            if resp.status().as_u16() == 404 {
+                not_found = true;
+            }
+            if resp.status().as_u16() == 429 {
+                too_many = true;
+            }
+        }
+        assert!(not_found);
+        assert!(too_many);
 
         Ok(())
     }

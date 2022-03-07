@@ -1,19 +1,23 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use http::uri::{Parts, Uri};
 use hyper::header::HeaderValue;
 use hyper::{Body, Request, StatusCode};
 use regex::Regex;
+use serde_json;
+use tokio::time::{self, Duration};
 
 use crate::proxy::error::MiddlewareError;
 use crate::proxy::middleware::MiddlewareResult::Next;
 use crate::proxy::middleware::{Middleware, MiddlewareResult};
 use crate::proxy::service::{ServiceContext, State};
 
-use serde_json;
-
-#[derive(Clone)]
+// #[derive(Clone)]
 pub struct Router {
     routes: RouterRules,
     name: String,
+    limiters: RouteLimiters,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -25,10 +29,17 @@ pub struct RouteRegex {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct LimitReq {
+    pub threshold_per_sec: usize,
+    pub key: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct Route {
     pub from: RouteRegex,
     pub to: RouteRegex,
     pub public: bool,
+    pub limit_config: Option<LimitReq>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -37,6 +48,7 @@ pub struct RouterRulesWrapper {
 }
 
 pub type RouterRules = Vec<Route>;
+type RouteLimiters = Vec<Option<Limiter>>;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct MatchedRoute {
@@ -104,7 +116,7 @@ impl Middleware for Router {
         let (host, path) = get_host_and_path(req)?;
         debug!("Routing => Host: {} Path: {}", host, path);
 
-        for route in routes {
+        for (i, route) in routes.iter().enumerate() {
             let (re_host, re_path) = (&route.from.host, &route.from.path);
             let to = &route.to;
             let public = route.public;
@@ -119,6 +131,19 @@ impl Middleware for Router {
                 } else {
                     continue;
                 };
+
+                if let Some(limiter) = &self.limiters[i] {
+                    // Ideally, the key is built based on configuration
+                    // we just use the client's IP address as POC
+                    let ip = context.remote_addr.ip().to_string();
+                    if !limiter.accept(&ip) {
+                        return Err(MiddlewareError::new(
+                            "Too many requests".to_string(),
+                            None,
+                            StatusCode::from_u16(429).unwrap(),
+                        ));
+                    }
+                }
 
                 debug!("Proxying to {}", &new_host);
                 inject_new_uri(req, &host, &new_host, &new_path)?;
@@ -160,9 +185,80 @@ fn read_routes<T: RouterConfig>(config: &T) -> RouterRules {
 
 impl Router {
     pub fn new<T: RouterConfig>(config: &T) -> Self {
-        Router {
+        let mut router = Router {
             routes: read_routes(config),
             name: String::from("Router"),
+            limiters: vec![],
+        };
+        for route in &router.routes {
+            if let Some(limit_config) = &route.limit_config {
+                router.limiters.push(Some(Limiter::new(limit_config)));
+            } else {
+                router.limiters.push(None);
+            }
         }
+
+        router
+    }
+}
+
+#[derive(Clone)]
+struct Limiter {
+    inner: Arc<Mutex<HashMap<String, u64>>>,
+}
+
+impl Limiter {
+    pub fn new(limit_config: &LimitReq) -> Limiter {
+        // let mut interval = time::interval(Duration::from_millis(50));
+        let inner = Arc::new(Mutex::new(HashMap::new()));
+        let limiter = Limiter { inner };
+
+        let to_update = limiter.clone();
+        let config = limit_config.clone();
+        // TODO: it is unclear to me the life cycle of such tokio tasks
+        let _clock = tokio::spawn(async move {
+            let mut interval = time::interval(Duration::from_millis(
+                1000 / config.threshold_per_sec as u64,
+            ));
+            loop {
+                interval.tick().await;
+                to_update.leak();
+            }
+        });
+        limiter
+    }
+
+    fn accept(&self, key: &str) -> bool {
+        self.try_fill(key).is_ok()
+    }
+
+    /// Let each bucket leak one drop
+    /// No-op if the bucket is already empty
+    fn leak(&self) {
+        let mut map = self.inner.lock().unwrap();
+        for (_, val) in map.iter_mut() {
+            if *val > 0 {
+                *val -= 1;
+            }
+        }
+    }
+
+    /// Try to fill a bucket
+    /// Return err if the bucket is full
+    fn try_fill(&self, bucket_id: &str) -> Result<(), &str> {
+        // TODO: read from config
+        let buffer_size = 10;
+        let mut map = self.inner.lock().unwrap();
+        return if let Some(queue_size) = map.get_mut(bucket_id) {
+            if *queue_size == buffer_size {
+                Err("full")
+            } else {
+                *queue_size += 1;
+                Ok(())
+            }
+        } else {
+            map.insert(bucket_id.to_string(), 1);
+            Ok(())
+        };
     }
 }

@@ -9,7 +9,11 @@
         "host": "localhost",
         "path": "/test_to"
       },
-      "public": false
+      "public": false,
+      "limit_config": {
+        "threshold_per_sec": 10,
+        "key": "ip"
+      }
     }
   ]
 }
